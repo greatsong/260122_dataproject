@@ -1,267 +1,158 @@
-import streamlit as st
-import yfinance as yf
+# main.py
+import glob
+from pathlib import Path
+
+import altair as alt
+import matplotlib.pyplot as plt
 import pandas as pd
-import plotly.graph_objects as go
-from datetime import datetime
-import time
+import streamlit as st
 
-# 페이지 설정
-st.set_page_config(
-    page_title="글로벌 시총 Top10 주가 분석",
-    page_icon="📈",
-    layout="wide"
-)
 
-# CSS 스타일링
-st.markdown("""
-<style>
-    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;600;700&display=swap');
-    * { font-family: 'Noto Sans KR', sans-serif; }
-    .stApp { background: #0f172a; }
-    div[data-testid="stMetricValue"] { color: #e2e8f0; }
-    div[data-testid="stMetricLabel"] { color: #94a3b8; }
-</style>
-""", unsafe_allow_html=True)
+st.set_page_config(page_title="최근 10일 기온 시각화", layout="wide")
+st.title("최근 10일 기온 시각화 (matplotlib / Streamlit / Altair)")
 
-# 글로벌 시총 Top10 종목
-TOP10_STOCKS = {
-    "AAPL": "Apple",
-    "MSFT": "Microsoft", 
-    "NVDA": "NVIDIA",
-    "GOOGL": "Alphabet",
-    "AMZN": "Amazon",
-    "META": "Meta",
-    "BRK-B": "Berkshire",
-    "TSM": "TSMC",
-    "LLY": "Eli Lilly",
-    "AVGO": "Broadcom"
-}
 
-def format_market_cap(mc):
-    if mc >= 1e12:
-        return "${:.2f}T".format(mc/1e12)
-    elif mc >= 1e9:
-        return "${:.2f}B".format(mc/1e9)
-    return "${:.0f}M".format(mc/1e6)
-
-@st.cache_data(ttl=3600)
-def get_stock_data(ticker):
-    """주식 데이터 가져오기"""
+def _detect_skiprows_for_kma_style(file_path: str, encoding: str = "cp949") -> int:
+    """
+    '기온분석'처럼 상단에 메타정보가 있고,
+    헤더가 '날짜,지점,평균기온(℃),최저기온(℃),최고기온(℃)' 형태로 나오는 CSV를 자동 감지.
+    헤더 라인 인덱스를 찾아 skiprows로 사용.
+    """
     try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        hist = stock.history(period="5d")
-        
-        if len(hist) >= 2:
-            current_price = hist['Close'].iloc[-1]
-            prev_price = hist['Close'].iloc[-2]
-            price_change = current_price - prev_price
-            price_change_pct = (price_change / prev_price) * 100
-        else:
-            current_price = info.get('currentPrice', info.get('regularMarketPrice', 0))
-            price_change = 0
-            price_change_pct = 0
-        
-        return {
-            'name': info.get('shortName', ticker),
-            'price': current_price,
-            'change_pct': price_change_pct,
-            'market_cap': info.get('marketCap', 0),
-        }
-    except Exception as e:
-        return None
+        text = Path(file_path).read_bytes().decode(encoding, errors="ignore")
+    except Exception:
+        return 0
 
-@st.cache_data(ttl=3600)
-def get_all_data_with_delay():
-    """모든 종목 데이터를 딜레이와 함께 가져오기"""
-    results = {}
-    for ticker, name in TOP10_STOCKS.items():
-        data = get_stock_data(ticker)
-        if data:
-            results[ticker] = data
-        time.sleep(0.5)  # 요청 간 딜레이
-    return results
+    lines = text.splitlines()
+    header_idx = None
+    for i, line in enumerate(lines[:200]):  # 앞부분만 스캔
+        if ("날짜" in line) and ("," in line) and ("기온" in line):
+            header_idx = i
+            break
 
-@st.cache_data(ttl=3600)
-def get_history_data(ticker, days):
-    """N일 히스토리"""
-    try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period="{}d".format(days + 10))
-        return hist if not hist.empty else None
-    except:
-        return None
+    return header_idx if header_idx is not None else 0
 
-def calculate_n_day_return(ticker, days):
-    """N일 수익률"""
-    hist = get_history_data(ticker, days)
-    if hist is None or len(hist) < 2:
-        return None, None
-    df = hist.tail(days + 1)
-    if len(df) < 2:
-        return None, None
-    start = df['Close'].iloc[0]
-    end = df['Close'].iloc[-1]
-    return ((end - start) / start) * 100, hist
 
-# 메인
-st.title("📈 글로벌 시총 Top10 주가 분석")
+@st.cache_data(show_spinner=False)
+def load_data(file_path: str) -> pd.DataFrame:
+    # 인코딩 후보를 순서대로 시도
+    encodings = ["cp949", "euc-kr", "utf-8", "latin1"]
 
-update_time = datetime.now().strftime('%Y년 %m월 %d일 %H:%M')
-st.caption("📅 {} 기준".format(update_time))
-st.markdown("---")
+    last_err = None
+    for enc in encodings:
+        try:
+            skiprows = _detect_skiprows_for_kma_style(file_path, encoding=enc)
+            df = pd.read_csv(file_path, encoding=enc, skiprows=skiprows)
+            # 컬럼명/문자열 정리
+            df.columns = [str(c).strip() for c in df.columns]
+            return df
+        except Exception as e:
+            last_err = e
 
-# 사이드바
-st.sidebar.header("⚙️ 설정")
-analysis_days = st.sidebar.slider("분석 기간 (일)", 1, 365, 30)
+    raise RuntimeError(f"CSV를 읽지 못했습니다. (마지막 오류: {last_err})")
 
-if st.sidebar.button("🔄 새로고침"):
-    st.cache_data.clear()
-    st.rerun()
 
-# 데이터 로딩
-with st.spinner('🔄 주식 데이터를 불러오는 중... (약 5초 소요)'):
-    stock_data = get_all_data_with_delay()
+# --- 파일 선택 (같은 폴더에 있다고 가정) ---
+DEFAULT_FILE = "ta_20260122174530.csv"
 
-if not stock_data:
-    st.error("데이터를 불러올 수 없습니다. 잠시 후 새로고침을 눌러주세요.")
+csv_candidates = sorted(glob.glob("*.csv"))
+if DEFAULT_FILE not in csv_candidates and csv_candidates:
+    default_index = 0
+elif DEFAULT_FILE in csv_candidates:
+    default_index = csv_candidates.index(DEFAULT_FILE)
+else:
+    default_index = None
+
+st.sidebar.header("데이터 파일")
+if not csv_candidates:
+    st.error("현재 폴더에서 CSV 파일을 찾지 못했어요. (예: ta_20260122174530.csv 를 main.py와 같은 폴더에 두세요)")
     st.stop()
 
-st.sidebar.success("✅ {}/{} 종목 로드".format(len(stock_data), len(TOP10_STOCKS)))
-
-# N일 수익률 계산
-with st.spinner('📊 수익률 계산 중...'):
-    for ticker in list(stock_data.keys()):
-        n_return, hist = calculate_n_day_return(ticker, analysis_days)
-        if n_return is not None:
-            stock_data[ticker]['n_day_return'] = n_return
-            stock_data[ticker]['hist'] = hist
-        else:
-            stock_data[ticker]['n_day_return'] = stock_data[ticker]['change_pct']
-            stock_data[ticker]['hist'] = None
-        time.sleep(0.3)
-
-# 정렬
-sorted_data = sorted(stock_data.items(), key=lambda x: x[1]['n_day_return'], reverse=True)
-best_ticker, best_data = sorted_data[0]
-worst_ticker, worst_data = sorted_data[-1]
-avg_return = sum(d['n_day_return'] for _, d in sorted_data) / len(sorted_data)
-
-# 메트릭
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    st.metric(
-        label="🚀 최고 상승 - {}".format(best_data['name']),
-        value="${:.2f}".format(best_data['price']),
-        delta="{:.2f}%".format(best_data['n_day_return'])
-    )
-
-with col2:
-    st.metric(
-        label="📉 최고 하락 - {}".format(worst_data['name']),
-        value="${:.2f}".format(worst_data['price']),
-        delta="{:.2f}%".format(worst_data['n_day_return'])
-    )
-
-with col3:
-    st.metric(
-        label="📊 평균 수익률",
-        value="{:.2f}%".format(avg_return),
-        delta="Top10 평균"
-    )
-
-st.markdown("---")
-
-# 바 차트
-st.subheader("📊 최근 {}일 수익률 비교".format(analysis_days))
-
-names = [d['name'] for _, d in sorted_data]
-returns = [d['n_day_return'] for _, d in sorted_data]
-colors = ['#22c55e' if r >= 0 else '#ef4444' for r in returns]
-
-fig_bar = go.Figure(data=[
-    go.Bar(
-        x=names,
-        y=returns,
-        marker_color=colors,
-        text=["{:.1f}%".format(r) for r in returns],
-        textposition='outside'
-    )
-])
-
-fig_bar.update_layout(
-    xaxis_title="종목",
-    yaxis_title="수익률 (%)",
-    height=450,
-    paper_bgcolor='rgba(0,0,0,0)',
-    plot_bgcolor='rgba(0,0,0,0)',
-    font=dict(color='#e2e8f0'),
-    xaxis=dict(gridcolor='#334155', tickfont=dict(color='#94a3b8')),
-    yaxis=dict(gridcolor='#334155', tickfont=dict(color='#94a3b8'))
+file_path = st.sidebar.selectbox(
+    "사용할 CSV 선택",
+    options=csv_candidates,
+    index=default_index if default_index is not None else 0,
 )
 
-st.plotly_chart(fig_bar, use_container_width=True)
+df = load_data(file_path)
 
-st.markdown("---")
+# --- 날짜 컬럼 찾기 ---
+date_col = None
+for cand in ["날짜", "date", "Date", "DATE"]:
+    if cand in df.columns:
+        date_col = cand
+        break
 
-# 라인 차트
-st.subheader("📈 주가 추이 (정규화)")
+if date_col is None:
+    # 혹시 첫 컬럼이 날짜일 수 있으니 검사
+    first_col = df.columns[0]
+    date_col = first_col
 
-available = [t for t, d in stock_data.items() if d.get('hist') is not None]
+# 날짜 파싱
+df[date_col] = df[date_col].astype(str).str.strip()
+df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
 
-selected = st.multiselect(
-    "종목 선택",
-    options=available,
-    default=[best_ticker, worst_ticker] if best_ticker in available and worst_ticker in available else available[:2],
-    format_func=lambda x: "{} ({})".format(TOP10_STOCKS[x], x)
-)
+df = df.dropna(subset=[date_col]).sort_values(date_col)
 
-if selected:
-    fig_line = go.Figure()
-    
-    for ticker in selected:
-        hist = stock_data[ticker].get('hist')
-        if hist is not None and len(hist) > 1:
-            df = hist.tail(analysis_days + 1)
-            normalized = (df['Close'] / df['Close'].iloc[0]) * 100
-            fig_line.add_trace(go.Scatter(
-                x=df.index,
-                y=normalized,
-                mode='lines',
-                name=TOP10_STOCKS[ticker]
-            ))
-    
-    fig_line.update_layout(
-        xaxis_title="날짜",
-        yaxis_title="정규화 (시작=100)",
-        height=450,
-        hovermode='x unified',
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
-        font=dict(color='#e2e8f0'),
-        xaxis=dict(gridcolor='#334155'),
-        yaxis=dict(gridcolor='#334155')
+# --- 기온 컬럼 찾기 ---
+# (기상청 '기온분석' CSV 기준: 평균기온(℃), 최저기온(℃), 최고기온(℃))
+temp_candidates = ["평균기온(℃)", "최저기온(℃)", "최고기온(℃)", "평균기온", "최저기온", "최고기온"]
+temp_cols = [c for c in temp_candidates if c in df.columns]
+
+# 숫자 변환
+for c in temp_cols:
+    df[c] = pd.to_numeric(df[c], errors="coerce")
+
+if not temp_cols:
+    # fallback: 숫자형 컬럼 중 앞에서 몇 개를 온도로 간주
+    numeric_cols = [c for c in df.columns if c != date_col]
+    # 숫자 변환 시도
+    for c in numeric_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    numeric_cols = [c for c in numeric_cols if pd.api.types.is_numeric_dtype(df[c])]
+    temp_cols = numeric_cols[:3]  # 최대 3개만
+    if not temp_cols:
+        st.error("기온(숫자) 컬럼을 찾지 못했어요. CSV 컬럼명을 확인해 주세요.")
+        st.write("컬럼 목록:", list(df.columns))
+        st.stop()
+
+# 최근 10일 데이터
+recent = df.tail(10).copy()
+
+st.subheader("최근 10일 데이터")
+st.dataframe(recent[[date_col] + temp_cols], use_container_width=True)
+
+left, right = st.columns([1, 1])
+
+with left:
+    st.markdown("### 1) matplotlib")
+    fig, ax = plt.subplots()
+    for c in temp_cols:
+        ax.plot(recent[date_col], recent[c], marker="o", label=c)
+    ax.set_xlabel("날짜")
+    ax.set_ylabel("기온")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    st.pyplot(fig, clear_figure=True)
+
+with right:
+    st.markdown("### 2) Streamlit 기본 그래프")
+    chart_df = recent.set_index(date_col)[temp_cols]
+    st.line_chart(chart_df)
+
+st.markdown("### 3) Altair")
+melted = recent[[date_col] + temp_cols].melt(id_vars=[date_col], var_name="구분", value_name="기온")
+alt_chart = (
+    alt.Chart(melted)
+    .mark_line(point=True)
+    .encode(
+        x=alt.X(f"{date_col}:T", title="날짜"),
+        y=alt.Y("기온:Q", title="기온"),
+        color=alt.Color("구분:N", title="구분"),
+        tooltip=[alt.Tooltip(f"{date_col}:T", title="날짜"), alt.Tooltip("구분:N"), alt.Tooltip("기온:Q")],
     )
-    
-    st.plotly_chart(fig_line, use_container_width=True)
+    .properties(height=380)
+)
+st.altair_chart(alt_chart, use_container_width=True)
 
-st.markdown("---")
-
-# 테이블
-st.subheader("📋 상세 데이터")
-
-table_data = []
-for ticker, data in sorted_data:
-    symbol = "+" if data['n_day_return'] >= 0 else ""
-    table_data.append({
-        "종목": "{} ({})".format(data['name'], ticker),
-        "현재가": "${:.2f}".format(data['price']),
-        "시가총액": format_market_cap(data['market_cap']),
-        "{}일 수익률".format(analysis_days): "{}{}%".format(symbol, round(data['n_day_return'], 2))
-    })
-
-st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
-
-st.caption("📈 데이터: Yahoo Finance | 1시간 캐시")
+st.caption("※ CSV가 '기온분석' 형식(상단 메타정보 포함)이어도 자동으로 헤더 라인을 찾아 읽도록 처리했습니다.")
