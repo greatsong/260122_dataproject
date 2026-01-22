@@ -1,158 +1,165 @@
 # main.py
+import os
 import glob
-from pathlib import Path
+from io import StringIO
 
-import altair as alt
-import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
+import matplotlib.pyplot as plt
+import altair as alt
+import plotly.express as px
+
 
 st.set_page_config(page_title="최근 10일 기온 시각화", layout="wide")
-st.title("최근 10일 기온 시각화 (matplotlib / Streamlit / Altair)")
+st.title("최근 10일 동안의 기온 (matplotlib / Streamlit / Altair / Plotly)")
 
 
-def _detect_skiprows_for_kma_style(file_path: str, encoding: str = "cp949") -> int:
+def find_header_row(csv_path: str, encoding_candidates=("utf-8", "cp949", "euc-kr")):
     """
-    '기온분석'처럼 상단에 메타정보가 있고,
-    헤더가 '날짜,지점,평균기온(℃),최저기온(℃),최고기온(℃)' 형태로 나오는 CSV를 자동 감지.
-    헤더 라인 인덱스를 찾아 skiprows로 사용.
+    CSV 앞부분에 설명행이 섞여있는(예: 기온분석) 파일에서
+    실제 헤더(예: '날짜,지점,평균기온(℃),...')가 있는 줄 번호를 찾는다.
     """
-    try:
-        text = Path(file_path).read_bytes().decode(encoding, errors="ignore")
-    except Exception:
-        return 0
+    for enc in encoding_candidates:
+        try:
+            with open(csv_path, "r", encoding=enc, errors="strict") as f:
+                for i in range(0, 200):  # 앞 200줄만 탐색
+                    line = f.readline()
+                    if not line:
+                        break
+                    # 헤더 후보 조건
+                    if ("날짜" in line) and ("," in line) and ("기온" in line):
+                        return i, enc
+        except UnicodeDecodeError:
+            continue
 
-    lines = text.splitlines()
-    header_idx = None
-    for i, line in enumerate(lines[:200]):  # 앞부분만 스캔
-        if ("날짜" in line) and ("," in line) and ("기온" in line):
-            header_idx = i
-            break
-
-    return header_idx if header_idx is not None else 0
+    # 못 찾으면 그래도 읽어보기(가장 흔한 인코딩 후보로)
+    return 0, "utf-8"
 
 
 @st.cache_data(show_spinner=False)
-def load_data(file_path: str) -> pd.DataFrame:
-    # 인코딩 후보를 순서대로 시도
-    encodings = ["cp949", "euc-kr", "utf-8", "latin1"]
+def load_temperature_csv(csv_path: str) -> pd.DataFrame:
+    header_row, enc = find_header_row(csv_path)
+    df = pd.read_csv(csv_path, encoding=enc, skiprows=header_row)
 
-    last_err = None
-    for enc in encodings:
-        try:
-            skiprows = _detect_skiprows_for_kma_style(file_path, encoding=enc)
-            df = pd.read_csv(file_path, encoding=enc, skiprows=skiprows)
-            # 컬럼명/문자열 정리
-            df.columns = [str(c).strip() for c in df.columns]
-            return df
-        except Exception as e:
-            last_err = e
+    # 첫 컬럼(날짜)에 탭이 붙는 경우가 있어 정리
+    date_col = None
+    for c in df.columns:
+        if "날짜" in str(c):
+            date_col = c
+            break
+    if date_col is None:
+        raise ValueError("날짜 컬럼을 찾지 못했습니다. (컬럼명에 '날짜'가 포함되어야 합니다)")
 
-    raise RuntimeError(f"CSV를 읽지 못했습니다. (마지막 오류: {last_err})")
+    df[date_col] = (
+        df[date_col]
+        .astype(str)
+        .str.replace("\t", "", regex=False)
+        .str.strip()
+    )
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df = df.dropna(subset=[date_col]).sort_values(date_col)
+
+    # 숫자 컬럼 정리
+    for c in df.columns:
+        if c == date_col:
+            continue
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    return df
 
 
-# --- 파일 선택 (같은 폴더에 있다고 가정) ---
-DEFAULT_FILE = "ta_20260122174530.csv"
-
-csv_candidates = sorted(glob.glob("*.csv"))
-if DEFAULT_FILE not in csv_candidates and csv_candidates:
-    default_index = 0
-elif DEFAULT_FILE in csv_candidates:
-    default_index = csv_candidates.index(DEFAULT_FILE)
-else:
-    default_index = None
-
-st.sidebar.header("데이터 파일")
-if not csv_candidates:
-    st.error("현재 폴더에서 CSV 파일을 찾지 못했어요. (예: ta_20260122174530.csv 를 main.py와 같은 폴더에 두세요)")
+# --- 데이터 파일 선택 ---
+csv_files = sorted(glob.glob("*.csv"))
+if not csv_files:
+    st.error("현재 폴더에서 CSV 파일을 찾지 못했습니다. main.py와 같은 폴더에 CSV를 넣어주세요.")
     st.stop()
 
-file_path = st.sidebar.selectbox(
-    "사용할 CSV 선택",
-    options=csv_candidates,
-    index=default_index if default_index is not None else 0,
-)
+chosen = st.selectbox("사용할 CSV 파일", csv_files, index=0)
+df = load_temperature_csv(chosen)
 
-df = load_data(file_path)
+# --- 컬럼 선택 ---
+date_col = next(c for c in df.columns if "날짜" in str(c))
+temp_candidates = [c for c in df.columns if ("기온" in str(c)) and (c != date_col)]
 
-# --- 날짜 컬럼 찾기 ---
-date_col = None
-for cand in ["날짜", "date", "Date", "DATE"]:
-    if cand in df.columns:
-        date_col = cand
-        break
+if not temp_candidates:
+    st.error("기온 관련 컬럼을 찾지 못했습니다. (컬럼명에 '기온'이 포함되어야 합니다)")
+    st.stop()
 
-if date_col is None:
-    # 혹시 첫 컬럼이 날짜일 수 있으니 검사
-    first_col = df.columns[0]
-    date_col = first_col
+default_cols = [c for c in temp_candidates if "평균" in str(c)] or temp_candidates[:1]
+selected_cols = st.multiselect("그래프에 표시할 기온 컬럼", temp_candidates, default=default_cols)
 
-# 날짜 파싱
-df[date_col] = df[date_col].astype(str).str.strip()
-df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+if not selected_cols:
+    st.warning("표시할 컬럼을 1개 이상 선택해주세요.")
+    st.stop()
 
-df = df.dropna(subset=[date_col]).sort_values(date_col)
+# --- 최근 10일 데이터 ---
+df_10 = df[[date_col] + selected_cols].dropna(subset=[date_col]).sort_values(date_col).tail(10)
+df_10 = df_10.reset_index(drop=True)
 
-# --- 기온 컬럼 찾기 ---
-# (기상청 '기온분석' CSV 기준: 평균기온(℃), 최저기온(℃), 최고기온(℃))
-temp_candidates = ["평균기온(℃)", "최저기온(℃)", "최고기온(℃)", "평균기온", "최저기온", "최고기온"]
-temp_cols = [c for c in temp_candidates if c in df.columns]
+# --- 요약 ---
+latest = df_10.iloc[-1]
+st.subheader("요약")
+cols = st.columns(min(4, len(selected_cols) + 1))
+cols[0].metric("마지막 날짜", latest[date_col].date().isoformat())
+for i, c in enumerate(selected_cols, start=1):
+    val = latest[c]
+    cols[i].metric(str(c), "결측" if pd.isna(val) else f"{val:.1f}")
 
-# 숫자 변환
-for c in temp_cols:
-    df[c] = pd.to_numeric(df[c], errors="coerce")
+with st.expander("최근 10일 데이터 보기"):
+    st.dataframe(df_10, use_container_width=True)
 
-if not temp_cols:
-    # fallback: 숫자형 컬럼 중 앞에서 몇 개를 온도로 간주
-    numeric_cols = [c for c in df.columns if c != date_col]
-    # 숫자 변환 시도
-    for c in numeric_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    numeric_cols = [c for c in numeric_cols if pd.api.types.is_numeric_dtype(df[c])]
-    temp_cols = numeric_cols[:3]  # 최대 3개만
-    if not temp_cols:
-        st.error("기온(숫자) 컬럼을 찾지 못했어요. CSV 컬럼명을 확인해 주세요.")
-        st.write("컬럼 목록:", list(df.columns))
-        st.stop()
+# =========================
+# 1) matplotlib
+# =========================
+st.header("1) matplotlib")
+fig, ax = plt.subplots()
+for c in selected_cols:
+    ax.plot(df_10[date_col], df_10[c], marker="o", label=str(c))
+ax.set_xlabel("날짜")
+ax.set_ylabel("기온")
+ax.set_title("최근 10일 기온 (matplotlib)")
+ax.legend()
+ax.grid(True, alpha=0.3)
+fig.autofmt_xdate()
+st.pyplot(fig, use_container_width=True)
 
-# 최근 10일 데이터
-recent = df.tail(10).copy()
+# =========================
+# 2) Streamlit 기본 그래프
+# =========================
+st.header("2) Streamlit 기본 그래프 (st.line_chart)")
+chart_df = df_10.set_index(date_col)[selected_cols]
+st.line_chart(chart_df)
 
-st.subheader("최근 10일 데이터")
-st.dataframe(recent[[date_col] + temp_cols], use_container_width=True)
-
-left, right = st.columns([1, 1])
-
-with left:
-    st.markdown("### 1) matplotlib")
-    fig, ax = plt.subplots()
-    for c in temp_cols:
-        ax.plot(recent[date_col], recent[c], marker="o", label=c)
-    ax.set_xlabel("날짜")
-    ax.set_ylabel("기온")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    st.pyplot(fig, clear_figure=True)
-
-with right:
-    st.markdown("### 2) Streamlit 기본 그래프")
-    chart_df = recent.set_index(date_col)[temp_cols]
-    st.line_chart(chart_df)
-
-st.markdown("### 3) Altair")
-melted = recent[[date_col] + temp_cols].melt(id_vars=[date_col], var_name="구분", value_name="기온")
+# =========================
+# 3) Altair
+# =========================
+st.header("3) Altair")
+long_df = df_10.melt(id_vars=[date_col], value_vars=selected_cols, var_name="구분", value_name="기온")
 alt_chart = (
-    alt.Chart(melted)
+    alt.Chart(long_df)
     .mark_line(point=True)
     .encode(
         x=alt.X(f"{date_col}:T", title="날짜"),
         y=alt.Y("기온:Q", title="기온"),
-        color=alt.Color("구분:N", title="구분"),
-        tooltip=[alt.Tooltip(f"{date_col}:T", title="날짜"), alt.Tooltip("구분:N"), alt.Tooltip("기온:Q")],
+        color=alt.Color("구분:N", title="컬럼"),
+        tooltip=[alt.Tooltip(f"{date_col}:T", title="날짜"), alt.Tooltip("구분:N"), alt.Tooltip("기온:Q", format=".1f")],
     )
     .properties(height=380)
+    .interactive()
 )
 st.altair_chart(alt_chart, use_container_width=True)
 
-st.caption("※ CSV가 '기온분석' 형식(상단 메타정보 포함)이어도 자동으로 헤더 라인을 찾아 읽도록 처리했습니다.")
+# =========================
+# 4) Plotly
+# =========================
+st.header("4) Plotly")
+plotly_fig = px.line(
+    df_10,
+    x=date_col,
+    y=selected_cols,
+    markers=True,
+    title="최근 10일 기온 (Plotly)"
+)
+plotly_fig.update_layout(xaxis_title="날짜", yaxis_title="기온")
+st.plotly_chart(plotly_fig, use_container_width=True)
