@@ -1,212 +1,159 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
+import plotly.express as px
 from datetime import datetime, timedelta
 
-# 페이지 설정
+# 페이지 기본 설정
 st.set_page_config(
-    page_title="글로벌 시총 Top10 주가 분석",
+    page_title="글로벌 Top 10 주가 분석",
     page_icon="📈",
     layout="wide"
 )
 
-# 글로벌 시총 Top10 종목 (2024년 기준)
-TOP10_STOCKS = {
-    "AAPL": "Apple",
-    "MSFT": "Microsoft",
-    "NVDA": "NVIDIA",
-    "GOOGL": "Alphabet (Google)",
-    "AMZN": "Amazon",
-    "META": "Meta (Facebook)",
-    "BRK-B": "Berkshire Hathaway",
-    "TSM": "TSMC",
-    "LLY": "Eli Lilly",
-    "AVGO": "Broadcom"
+# 글로벌 시총 상위 10개 종목 리스트 (티커 기준, 유동적일 수 있음)
+# Apple, Nvidia, Microsoft, Alphabet(Google), Amazon, Meta, TSMC, Berkshire Hathaway, Broadcom, Tesla
+TOP_10_TICKERS = {
+    'AAPL': 'Apple',
+    'NVDA': 'NVIDIA',
+    'MSFT': 'Microsoft',
+    'GOOGL': 'Alphabet (Google)',
+    'AMZN': 'Amazon',
+    'META': 'Meta (Facebook)',
+    'TSM': 'TSMC',
+    'BRK-B': 'Berkshire Hathaway',
+    'AVGO': 'Broadcom',
+    'TSLA': 'Tesla'
 }
 
-@st.cache_data(ttl=3600)
-def get_stock_data(tickers, days):
-    """주식 데이터 가져오기"""
+@st.cache_data
+def load_data(tickers, days):
+    """
+    yfinance를 이용해 주가 데이터를 가져오는 함수
+    """
     end_date = datetime.now()
-    start_date = end_date - timedelta(days=days + 10)  # 여유분 추가
+    start_date = end_date - timedelta(days=days)
     
-    data = {}
-    for ticker in tickers:
-        try:
-            stock = yf.Ticker(ticker)
-            hist = stock.history(start=start_date, end=end_date)
-            if not hist.empty:
-                data[ticker] = hist
-        except Exception as e:
-            st.warning(f"{ticker} 데이터 로드 실패: {e}")
+    # 여러 티커의 데이터를 한 번에 다운로드
+    data = yf.download(list(tickers.keys()), start=start_date, end=end_date, progress=False)
     
-    return data
+    # 'Close' 컬럼만 추출 (yfinance 버전에 따라 구조가 다를 수 있어 조정)
+    if 'Close' in data.columns:
+        df_close = data['Close']
+    elif 'Adj Close' in data.columns:
+        df_close = data['Adj Close']
+    else:
+        st.error("데이터를 가져오는데 실패했습니다.")
+        return pd.DataFrame()
+    
+    return df_close
 
-def calculate_returns(data, days):
-    """수익률 계산"""
-    returns = {}
-    for ticker, df in data.items():
-        if len(df) >= 2:
-            # 최근 N일 데이터만 사용
-            df_recent = df.tail(days + 1)
-            if len(df_recent) >= 2:
-                start_price = df_recent['Close'].iloc[0]
-                end_price = df_recent['Close'].iloc[-1]
-                pct_change = ((end_price - start_price) / start_price) * 100
-                returns[ticker] = {
-                    'name': TOP10_STOCKS[ticker],
-                    'start_price': start_price,
-                    'end_price': end_price,
-                    'change_pct': pct_change,
-                    'change_abs': end_price - start_price
-                }
-    return returns
+def calculate_performance(df):
+    """
+    기간 내 수익률 계산 함수
+    """
+    # 시작일과 종료일의 가격 비교 (결측치 제거)
+    df = df.dropna()
+    if len(df) < 2:
+        return pd.Series()
+    
+    start_price = df.iloc[0]
+    end_price = df.iloc[-1]
+    
+    # 수익률 계산: (종료가 - 시작가) / 시작가 * 100
+    performance = ((end_price - start_price) / start_price) * 100
+    return performance.sort_values(ascending=False)
 
-def main():
-    st.title("📈 글로벌 시총 Top10 주가 분석")
-    st.markdown("---")
-    
-    # 사이드바 설정
-    st.sidebar.header("⚙️ 설정")
-    days = st.sidebar.slider("분석 기간 (일)", min_value=1, max_value=365, value=30)
-    
+# === 사이드바 설정 ===
+st.sidebar.header("📊 분석 옵션 설정")
+n_days = st.sidebar.slider("분석할 기간 (최근 N일)", min_value=5, max_value=365, value=30)
+selected_tickers = st.sidebar.multiselect(
+    "분석할 종목 선택", 
+    options=list(TOP_10_TICKERS.keys()), 
+    default=list(TOP_10_TICKERS.keys()),
+    format_func=lambda x: f"{x} ({TOP_10_TICKERS[x]})"
+)
+
+# === 메인 화면 ===
+st.title(f"📈 글로벌 시총 Top 10: 최근 {n_days}일 주가 분석")
+st.markdown("글로벌 리딩 기업들의 최근 주가 흐름을 분석하고 가장 많이 오르거나 떨어진 종목을 찾습니다.")
+
+if not selected_tickers:
+    st.warning("분석할 종목을 하나 이상 선택해주세요.")
+else:
     # 데이터 로드
-    with st.spinner("주가 데이터를 불러오는 중..."):
-        stock_data = get_stock_data(list(TOP10_STOCKS.keys()), days)
-    
-    if not stock_data:
-        st.error("데이터를 불러올 수 없습니다.")
-        return
-    
-    # 수익률 계산
-    returns = calculate_returns(stock_data, days)
-    
-    if not returns:
-        st.error("수익률을 계산할 수 없습니다.")
-        return
-    
-    # 수익률 데이터프레임 생성
-    df_returns = pd.DataFrame(returns).T
-    df_returns = df_returns.sort_values('change_pct', ascending=False)
-    
-    # 최고/최저 종목
-    best_ticker = df_returns.index[0]
-    worst_ticker = df_returns.index[-1]
-    
-    # 메트릭 표시
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.metric(
-            label=f"🚀 최고 상승 - {returns[best_ticker]['name']}",
-            value=f"${returns[best_ticker]['end_price']:.2f}",
-            delta=f"{returns[best_ticker]['change_pct']:.2f}%"
-        )
-    
-    with col2:
-        st.metric(
-            label=f"📉 최고 하락 - {returns[worst_ticker]['name']}",
-            value=f"${returns[worst_ticker]['end_price']:.2f}",
-            delta=f"{returns[worst_ticker]['change_pct']:.2f}%"
-        )
-    
-    with col3:
-        avg_return = df_returns['change_pct'].mean()
-        st.metric(
-            label="📊 평균 수익률",
-            value=f"{avg_return:.2f}%",
-            delta="Top10 평균"
-        )
-    
-    st.markdown("---")
-    
-    # 수익률 바 차트
-    st.subheader(f"📊 최근 {days}일 수익률 비교")
-    
-    colors = ['#00CC96' if x >= 0 else '#EF553B' for x in df_returns['change_pct']]
-    
-    fig_bar = go.Figure(data=[
-        go.Bar(
-            x=[f"{row['name']}" for _, row in df_returns.iterrows()],
-            y=df_returns['change_pct'],
-            marker_color=colors,
-            text=[f"{x:.2f}%" for x in df_returns['change_pct']],
-            textposition='outside'
-        )
-    ])
-    
-    fig_bar.update_layout(
-        xaxis_title="종목",
-        yaxis_title="수익률 (%)",
-        height=500,
-        showlegend=False
-    )
-    
-    st.plotly_chart(fig_bar, use_container_width=True)
-    
-    st.markdown("---")
-    
-    # 주가 추이 차트
-    st.subheader("📈 주가 추이")
-    
-    selected_stocks = st.multiselect(
-        "종목 선택",
-        options=list(TOP10_STOCKS.keys()),
-        default=[best_ticker, worst_ticker],
-        format_func=lambda x: f"{TOP10_STOCKS[x]} ({x})"
-    )
-    
-    if selected_stocks:
-        fig_line = go.Figure()
+    with st.spinner('데이터를 불러오는 중입니다...'):
+        df = load_data(TOP_10_TICKERS, n_days)
         
-        for ticker in selected_stocks:
-            if ticker in stock_data:
-                df = stock_data[ticker].tail(days + 1)
-                # 정규화 (시작점 = 100)
-                normalized = (df['Close'] / df['Close'].iloc[0]) * 100
-                
-                fig_line.add_trace(go.Scatter(
-                    x=df.index,
-                    y=normalized,
-                    mode='lines',
-                    name=f"{TOP10_STOCKS[ticker]} ({ticker})",
-                    hovertemplate=f"{TOP10_STOCKS[ticker]}<br>날짜: %{{x}}<br>정규화: %{{y:.2f}}<br>실제가: $%{{customdata:.2f}}<extra></extra>",
-                    customdata=df['Close']
-                ))
+        # 선택된 종목만 필터링
+        df_selected = df[selected_tickers]
         
-        fig_line.update_layout(
-            xaxis_title="날짜",
-            yaxis_title="정규화 가격 (시작=100)",
-            height=500,
-            hovermode='x unified',
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-        )
-        
-        st.plotly_chart(fig_line, use_container_width=True)
-    
-    st.markdown("---")
-    
-    # 상세 데이터 테이블
-    st.subheader("📋 상세 데이터")
-    
-    display_df = df_returns.copy()
-    display_df.index = [f"{TOP10_STOCKS[t]} ({t})" for t in display_df.index]
-    display_df.columns = ['종목명', '시작가($)', '종가($)', '변동률(%)', '변동액($)']
-    display_df = display_df.drop('종목명', axis=1)
-    
-    # 포맷팅
-    display_df['시작가($)'] = display_df['시작가($)'].apply(lambda x: f"${x:.2f}")
-    display_df['종가($)'] = display_df['종가($)'].apply(lambda x: f"${x:.2f}")
-    display_df['변동률(%)'] = display_df['변동률(%)'].apply(lambda x: f"{x:.2f}%")
-    display_df['변동액($)'] = display_df['변동액($)'].apply(lambda x: f"${x:.2f}")
-    
-    st.dataframe(display_df, use_container_width=True)
-    
-    # 푸터
-    st.markdown("---")
-    st.caption("데이터 출처: Yahoo Finance | 시총 순위는 변동될 수 있습니다.")
+        # 수익률 계산
+        performance = calculate_performance(df_selected)
 
-if __name__ == "__main__":
-    main()
+    # === 1. 핵심 지표 (가장 많이 오른/내린 종목) ===
+    if not performance.empty:
+        best_stock = performance.index[0]
+        worst_stock = performance.index[-1]
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("🚀 최고 상승 종목")
+            st.metric(
+                label=f"{TOP_10_TICKERS[best_stock]} ({best_stock})", 
+                value=f"{df_selected[best_stock].iloc[-1]:.2f} USD",
+                delta=f"{performance[best_stock]:.2f}%"
+            )
+            
+        with col2:
+            st.subheader("💧 최고 하락(최저 상승) 종목")
+            st.metric(
+                label=f"{TOP_10_TICKERS[worst_stock]} ({worst_stock})", 
+                value=f"{df_selected[worst_stock].iloc[-1]:.2f} USD",
+                delta=f"{performance[worst_stock]:.2f}%"
+            )
+
+        st.divider()
+
+        # === 2. 수익률 비교 바 차트 (Plotly) ===
+        st.subheader(f"📊 종목별 수익률 비교 (최근 {n_days}일)")
+        
+        colors = ['red' if x >= 0 else 'blue' for x in performance.values]
+        
+        fig_bar = go.Figure(go.Bar(
+            x=performance.index,
+            y=performance.values,
+            text=[f"{val:.1f}%" for val in performance.values],
+            textposition='auto',
+            marker_color=colors
+        ))
+        
+        fig_bar.update_layout(
+            xaxis_title="종목 (Ticker)",
+            yaxis_title="수익률 (%)",
+            showlegend=False
+        )
+        st.plotly_chart(fig_bar, use_container_width=True)
+
+        # === 3. 주가 추이 라인 차트 (Plotly) ===
+        st.subheader(f"📈 주가 변동 추이")
+        
+        # 정규화된 그래프 (시작점을 0%로 맞춤) vs 실제 가격 선택
+        view_option = st.radio("차트 보기 방식", ["수익률 기준 (%)", "실제 주가 (USD)"], horizontal=True)
+        
+        if view_option == "수익률 기준 (%)":
+            # 시작일 가격 기준 변화율로 변환
+            df_normalized = (df_selected / df_selected.iloc[0] - 1) * 100
+            fig_line = px.line(df_normalized, x=df_normalized.index, y=df_normalized.columns)
+            fig_line.update_layout(yaxis_title="누적 수익률 (%)")
+        else:
+            fig_line = px.line(df_selected, x=df_selected.index, y=df_selected.columns)
+            fig_line.update_layout(yaxis_title="주가 (USD)")
+
+        st.plotly_chart(fig_line, use_container_width=True)
+        
+        # === 4. 상세 데이터 보기 ===
+        with st.expander("데이터 원본 보기"):
+            st.dataframe(df_selected.sort_index(ascending=False))
