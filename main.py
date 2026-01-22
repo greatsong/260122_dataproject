@@ -1,319 +1,259 @@
-# main.py
-import time
-from datetime import datetime, timedelta
-
-import pandas as pd
-import plotly.express as px
-import requests
 import streamlit as st
 import yfinance as yf
-from pandas_datareader import data as pdr
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
+import time
 
-st.set_page_config(page_title="Global Top10 Movers", layout="wide")
+# 페이지 설정
+st.set_page_config(
+    page_title="글로벌 시총 Top10 주가 분석",
+    page_icon="📈",
+    layout="wide"
+)
 
-DEFAULT_TOP10 = {
-    "NVDA": "NVIDIA",
+# 글로벌 시총 Top10 종목 (2024년 기준)
+TOP10_STOCKS = {
     "AAPL": "Apple",
-    "GOOG": "Alphabet (GOOG)",
     "MSFT": "Microsoft",
+    "NVDA": "NVIDIA",
+    "GOOGL": "Alphabet (Google)",
     "AMZN": "Amazon",
-    "TSM": "TSMC (ADR)",
-    "META": "Meta Platforms",
-    "AVGO": "Broadcom",
-    "TSLA": "Tesla",
-    "BRK-B": "Berkshire Hathaway (B)",
+    "META": "Meta (Facebook)",
+    "BRK-B": "Berkshire Hathaway",
+    "TSM": "TSMC",
+    "LLY": "Eli Lilly",
+    "AVGO": "Broadcom"
 }
 
-# --- Yahoo 차단 완화용 Session(User-Agent) ---
-def make_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update(
-        {
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            )
-        }
-    )
-    return s
-
-
-def quick_yahoo_healthcheck(session: requests.Session) -> tuple[bool, str]:
-    """
-    Yahoo 엔드포인트가 최소한 응답은 하는지 빠르게 체크.
-    (권한/차단이면 401/403/429가 뜨는 경우가 많음)
-    """
-    url = "https://query1.finance.yahoo.com/v7/finance/quote?symbols=AAPL"
-    try:
-        r = session.get(url, timeout=8)
-        return (200 <= r.status_code < 300), f"Yahoo healthcheck status={r.status_code}"
-    except Exception as e:
-        return False, f"Yahoo healthcheck error: {type(e).__name__}: {e}"
-
-
-@st.cache_data(show_spinner=False, ttl=60 * 60)
-def fetch_prices_yfinance(tickers: list[str], lookback_calendar_days: int) -> tuple[pd.DataFrame, str | None]:
-    """
-    yfinance로 멀티티커 배치 다운로드.
-    return: (long_df, err)
-    """
-    if not tickers:
-        return pd.DataFrame(), "No tickers."
-
-    end = datetime.utcnow().date() + timedelta(days=1)
-    start = end - timedelta(days=lookback_calendar_days)
-    session = make_session()
-
-    # (선택) healthcheck
-    ok, msg = quick_yahoo_healthcheck(session)
-
-    last_err = None
-    for attempt in range(1, 4):
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_stock_data(tickers_tuple, days):
+    """주식 데이터 가져오기 - 배치 다운로드로 Rate Limit 방지"""
+    tickers = list(tickers_tuple)
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=days + 10)
+    
+    data = {}
+    max_retries = 3
+    
+    for attempt in range(max_retries):
         try:
-            raw = yf.download(
-                tickers=tickers,
-                start=start.isoformat(),
-                end=end.isoformat(),
-                group_by="column",
+            # 모든 종목을 한 번에 다운로드 (Rate Limit 방지)
+            tickers_str = " ".join(tickers)
+            df_all = yf.download(
+                tickers_str,
+                start=start_date,
+                end=end_date,
+                group_by='ticker',
                 progress=False,
-                threads=True,
-                auto_adjust=False,
-                session=session,
+                threads=False  # 스레드 비활성화로 안정성 향상
             )
-            if raw is None or raw.empty:
-                last_err = f"yfinance returned empty dataframe. ({msg})"
-                time.sleep(0.9 * attempt)
-                continue
-
-            raw = raw.reset_index()
-
-            # 멀티티커 -> long 변환
-            if isinstance(raw.columns, pd.MultiIndex):
-                date_col = raw.columns[0]
-                fields = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
-                long_rows = []
-
-                for t in tickers:
-                    has_any = any(((f, t) in raw.columns) for f in fields)
-                    if not has_any:
-                        continue
-
-                    tmp = pd.DataFrame({"Date": raw[date_col]})
-                    for f in fields:
-                        tmp[f] = raw[(f, t)] if (f, t) in raw.columns else pd.NA
-                    tmp["Ticker"] = t
-                    long_rows.append(tmp)
-
-                out = pd.concat(long_rows, ignore_index=True) if long_rows else pd.DataFrame()
+            
+            if df_all.empty:
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)  # 지수 백오프
+                    continue
+                return {}
+            
+            # 단일 종목인 경우 처리
+            if len(tickers) == 1:
+                ticker = tickers[0]
+                data[ticker] = df_all[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
             else:
-                # 단일 티커
-                out = raw.copy()
-                out["Ticker"] = tickers[0]
-                if "Date" not in out.columns and "index" in out.columns:
-                    out.rename(columns={"index": "Date"}, inplace=True)
-
-            out = out.dropna(subset=["Close"])
-            out["Date"] = pd.to_datetime(out["Date"])
-            out = out.sort_values(["Ticker", "Date"])
-            return out, None
-
+                # 여러 종목인 경우 분리
+                for ticker in tickers:
+                    try:
+                        if ticker in df_all.columns.get_level_values(0):
+                            ticker_data = df_all[ticker].copy()
+                            ticker_data = ticker_data.dropna()
+                            if not ticker_data.empty:
+                                data[ticker] = ticker_data
+                    except Exception:
+                        continue
+            
+            if data:
+                return data
+                
         except Exception as e:
-            last_err = f"{type(e).__name__}: {e} ({msg})"
-            time.sleep(0.9 * attempt)
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+            else:
+                st.error(f"데이터 로드 실패: {e}")
+    
+    return data
 
-    return pd.DataFrame(), last_err
+def calculate_returns(data, days):
+    """수익률 계산"""
+    returns = {}
+    for ticker, df in data.items():
+        if len(df) >= 2:
+            df_recent = df.tail(days + 1)
+            if len(df_recent) >= 2:
+                start_price = df_recent['Close'].iloc[0]
+                end_price = df_recent['Close'].iloc[-1]
+                pct_change = ((end_price - start_price) / start_price) * 100
+                returns[ticker] = {
+                    'name': TOP10_STOCKS.get(ticker, ticker),
+                    'start_price': float(start_price),
+                    'end_price': float(end_price),
+                    'change_pct': float(pct_change),
+                    'change_abs': float(end_price - start_price)
+                }
+    return returns
 
-
-@st.cache_data(show_spinner=False, ttl=60 * 60)
-def fetch_prices_stooq_fallback(tickers: list[str], lookback_calendar_days: int) -> tuple[pd.DataFrame, str | None]:
-    """
-    yfinance가 막힐 때 Stooq로 대체 수집.
-    Stooq는 보통 US 종목을 'AAPL.US' 형태로 받음.
-    """
-    if not tickers:
-        return pd.DataFrame(), "No tickers."
-
-    end = datetime.utcnow().date() + timedelta(days=1)
-    start = end - timedelta(days=lookback_calendar_days)
-
-    rows = []
-    errs = []
-
-    for t in tickers:
-        # BRK-B 등 특수표기 보정: Stooq는 '-' 대신 '.' 또는 다른 표기를 쓰는 경우가 있어 예외처리
-        # 가장 많이 통하는 기본: 미국주식은 {TICKER}.US
-        stooq_symbol = f"{t.replace('-', '.').upper()}.US"
-        try:
-            df = pdr.DataReader(stooq_symbol, "stooq", start, end)
-            if df is None or df.empty:
-                errs.append(f"{t}: stooq empty ({stooq_symbol})")
-                continue
-
-            df = df.reset_index().rename(columns={"Date": "Date"})
-            # stooq는 컬럼명이 대문자(Open/High/Low/Close/Volume)
-            rename_map = {"Open": "Open", "High": "High", "Low": "Low", "Close": "Close", "Volume": "Volume"}
-            df = df.rename(columns=rename_map)
-
-            df["Date"] = pd.to_datetime(df["Date"])
-            df = df.sort_values("Date")
-
-            df["Adj Close"] = pd.NA
-            df["Ticker"] = t
-            df = df[["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume", "Ticker"]]
-            rows.append(df)
-        except Exception as e:
-            errs.append(f"{t}: {type(e).__name__}: {e} ({stooq_symbol})")
-
-    if not rows:
-        return pd.DataFrame(), " / ".join(errs) if errs else "stooq failed."
-
-    out = pd.concat(rows, ignore_index=True)
-    out = out.dropna(subset=["Close"]).sort_values(["Ticker", "Date"])
-    err = " / ".join(errs) if errs else None
-    return out, err
-
-
-def compute_move(prices: pd.DataFrame, ticker: str, n_trading_days: int) -> dict:
-    df = prices[prices["Ticker"] == ticker].sort_values("Date")
-    if df.empty:
-        return {"start_close": None, "last_close": None, "chg": None, "pct": None, "used_days": 0, "points": 0}
-
-    close = df["Close"].dropna()
-    if close.shape[0] < 2:
-        last = float(close.iloc[-1]) if close.shape[0] else None
-        return {"start_close": None, "last_close": last, "chg": None, "pct": None, "used_days": int(close.shape[0]), "points": int(df.shape[0])}
-
-    idx_start = max(0, close.shape[0] - 1 - n_trading_days)
-    start_close = float(close.iloc[idx_start])
-    last_close = float(close.iloc[-1])
-    chg = last_close - start_close
-    pct = (chg / start_close) * 100 if start_close != 0 else None
-    used_days = (close.shape[0] - 1) - idx_start
-
-    return {
-        "start_close": start_close,
-        "last_close": last_close,
-        "chg": chg,
-        "pct": pct,
-        "used_days": used_days,
-        "points": int(df.shape[0]),
-    }
-
-
-st.title("🌍 글로벌 Top10: 최근 N일 변동 Top/Bottom (yfinance + Plotly)")
-st.caption("yfinance가 빈 데이터로 떨어지면 자동으로 Stooq로 fallback합니다.")
-
-with st.sidebar:
-    st.header("설정")
-    n_days = st.slider("최근 N일(거래일 기준에 가깝게)", 1, 120, 20, 1)
-    metric = st.radio("정렬 기준", ["등락률(%)", "등락액(가격)"], horizontal=True)
-
-    lookback_calendar = int(max(60, n_days * 3))
-
-    st.divider()
-    tickers_text = st.text_area("티커(쉼표 구분)", value=",".join(DEFAULT_TOP10.keys()), height=80)
-    tickers = [t.strip().upper() for t in tickers_text.split(",") if t.strip()]
-    top_k = st.slider("Top/Bottom 개수", 3, 10, 5, 1)
-
-    st.divider()
-    chart_mode = st.selectbox("차트", ["개별 종목 라인", "등락률 막대", "등락액 막대"])
-
-run = st.button("🚀 분석 실행", type="primary")
-
-if not run:
-    st.info("왼쪽 설정 후 **‘🚀 분석 실행’** 버튼을 눌러 주세요.")
-    st.stop()
-
-# --- 1) yfinance 시도 ---
-with st.spinner("1) yfinance로 데이터 불러오는 중..."):
-    prices, err = fetch_prices_yfinance(tickers, lookback_calendar)
-
-source_used = "yfinance"
-
-# --- 2) 실패하면 Stooq fallback ---
-if prices.empty:
-    st.warning("yfinance가 빈 데이터를 반환했어요. (Yahoo 차단/429 가능) → Stooq로 대체 수집합니다.")
-    with st.spinner("2) Stooq로 대체 수집 중..."):
-        prices, err2 = fetch_prices_stooq_fallback(tickers, lookback_calendar)
-    source_used = "stooq-fallback"
-    if err:
-        st.code(f"yfinance debug: {err}")
-    if err2:
-        st.code(f"stooq note: {err2}")
-
-if prices.empty:
-    st.error("yfinance도 실패했고, fallback도 실패했어요.")
-    st.write("가능한 원인: (1) 외부망 차단 (2) 해당 종목의 stooq 티커 매칭 실패 (3) 일시적 네트워크 문제")
-    st.stop()
-
-st.success(f"데이터 소스: {source_used}")
-
-# --- 계산 ---
-rows = []
-for t in tickers:
-    m = compute_move(prices, t, n_days)
-    rows.append(
-        {
-            "Ticker": t,
-            "Name": DEFAULT_TOP10.get(t, t),
-            "Start Close": m["start_close"],
-            "Last Close": m["last_close"],
-            "Change": m["chg"],
-            "Change (%)": m["pct"],
-            "Used Trading Days": m["used_days"],
-            "Data Points": m["points"],
-        }
+def main():
+    st.title("📈 글로벌 시총 Top10 주가 분석")
+    st.markdown("---")
+    
+    # 사이드바 설정
+    st.sidebar.header("⚙️ 설정")
+    days = st.sidebar.slider("분석 기간 (일)", min_value=1, max_value=365, value=30)
+    
+    # 캐시 초기화 버튼
+    if st.sidebar.button("🔄 데이터 새로고침"):
+        st.cache_data.clear()
+        st.rerun()
+    
+    # 데이터 로드
+    with st.spinner("주가 데이터를 불러오는 중... (최초 로드 시 시간이 걸릴 수 있습니다)"):
+        stock_data = get_stock_data(tuple(TOP10_STOCKS.keys()), days)
+    
+    if not stock_data:
+        st.error("데이터를 불러올 수 없습니다. 잠시 후 '데이터 새로고침' 버튼을 눌러주세요.")
+        st.info("💡 Yahoo Finance API의 요청 제한으로 인해 일시적으로 데이터를 가져올 수 없습니다.")
+        return
+    
+    # 로드된 종목 수 표시
+    st.sidebar.success(f"✅ {len(stock_data)}/{len(TOP10_STOCKS)} 종목 로드됨")
+    
+    # 수익률 계산
+    returns = calculate_returns(stock_data, days)
+    
+    if not returns:
+        st.error("수익률을 계산할 수 없습니다.")
+        return
+    
+    # 수익률 데이터프레임 생성
+    df_returns = pd.DataFrame(returns).T
+    df_returns = df_returns.sort_values('change_pct', ascending=False)
+    
+    # 최고/최저 종목
+    best_ticker = df_returns.index[0]
+    worst_ticker = df_returns.index[-1]
+    
+    # 메트릭 표시
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric(
+            label=f"🚀 최고 상승 - {returns[best_ticker]['name']}",
+            value=f"${returns[best_ticker]['end_price']:.2f}",
+            delta=f"{returns[best_ticker]['change_pct']:.2f}%"
+        )
+    
+    with col2:
+        st.metric(
+            label=f"📉 최고 하락 - {returns[worst_ticker]['name']}",
+            value=f"${returns[worst_ticker]['end_price']:.2f}",
+            delta=f"{returns[worst_ticker]['change_pct']:.2f}%"
+        )
+    
+    with col3:
+        avg_return = df_returns['change_pct'].mean()
+        st.metric(
+            label="📊 평균 수익률",
+            value=f"{avg_return:.2f}%",
+            delta="Top10 평균"
+        )
+    
+    st.markdown("---")
+    
+    # 수익률 바 차트
+    st.subheader(f"📊 최근 {days}일 수익률 비교")
+    
+    colors = ['#00CC96' if x >= 0 else '#EF553B' for x in df_returns['change_pct']]
+    
+    fig_bar = go.Figure(data=[
+        go.Bar(
+            x=[f"{row['name']}" for _, row in df_returns.iterrows()],
+            y=df_returns['change_pct'],
+            marker_color=colors,
+            text=[f"{x:.2f}%" for x in df_returns['change_pct']],
+            textposition='outside'
+        )
+    ])
+    
+    fig_bar.update_layout(
+        xaxis_title="종목",
+        yaxis_title="수익률 (%)",
+        height=500,
+        showlegend=False
     )
-
-result = pd.DataFrame(rows)
-
-if metric == "등락률(%)":
-    sortable = result.dropna(subset=["Change (%)"]).copy()
-    sort_col = "Change (%)"
-else:
-    sortable = result.dropna(subset=["Change"]).copy()
-    sort_col = "Change"
-
-sortable = sortable.sort_values(sort_col, ascending=False).reset_index(drop=True)
-
-c1, c2 = st.columns(2)
-with c1:
-    st.subheader(f"📈 상승 Top {top_k}")
-    st.dataframe(sortable.head(top_k), use_container_width=True)
-with c2:
-    st.subheader(f"📉 하락 Top {top_k}")
-    st.dataframe(sortable.tail(top_k).sort_values(sort_col, ascending=True), use_container_width=True)
-
-st.divider()
-st.subheader("전체 결과")
-st.dataframe(sortable, use_container_width=True)
-
-st.divider()
-st.subheader("📊 시각화")
-
-if chart_mode == "개별 종목 라인":
-    pick = st.selectbox("종목 선택", sortable["Ticker"].tolist(), index=0)
-    dfp = prices[prices["Ticker"] == pick].sort_values("Date").tail(max(90, n_days * 2))
-    fig = px.line(dfp, x="Date", y="Close", title=f"{pick} Close Price (최근 구간)")
-    st.plotly_chart(fig, use_container_width=True)
-
-elif chart_mode == "등락률 막대":
-    fig = px.bar(
-        sortable.dropna(subset=["Change (%)"]),
-        x="Ticker",
-        y="Change (%)",
-        hover_data=["Name", "Used Trading Days", "Data Points"],
-        title=f"최근 ~{n_days} 거래일 등락률(%) 비교",
+    
+    st.plotly_chart(fig_bar, use_container_width=True)
+    
+    st.markdown("---")
+    
+    # 주가 추이 차트
+    st.subheader("📈 주가 추이")
+    
+    available_stocks = [t for t in TOP10_STOCKS.keys() if t in stock_data]
+    
+    selected_stocks = st.multiselect(
+        "종목 선택",
+        options=available_stocks,
+        default=[best_ticker, worst_ticker] if best_ticker in available_stocks and worst_ticker in available_stocks else available_stocks[:2],
+        format_func=lambda x: f"{TOP10_STOCKS[x]} ({x})"
     )
-    st.plotly_chart(fig, use_container_width=True)
+    
+    if selected_stocks:
+        fig_line = go.Figure()
+        
+        for ticker in selected_stocks:
+            if ticker in stock_data:
+                df = stock_data[ticker].tail(days + 1)
+                normalized = (df['Close'] / df['Close'].iloc[0]) * 100
+                
+                fig_line.add_trace(go.Scatter(
+                    x=df.index,
+                    y=normalized,
+                    mode='lines',
+                    name=f"{TOP10_STOCKS[ticker]} ({ticker})",
+                    hovertemplate=f"{TOP10_STOCKS[ticker]}<br>날짜: %{{x}}<br>정규화: %{{y:.2f}}<br>실제가: $%{{customdata:.2f}}<extra></extra>",
+                    customdata=df['Close']
+                ))
+        
+        fig_line.update_layout(
+            xaxis_title="날짜",
+            yaxis_title="정규화 가격 (시작=100)",
+            height=500,
+            hovermode='x unified',
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        
+        st.plotly_chart(fig_line, use_container_width=True)
+    
+    st.markdown("---")
+    
+    # 상세 데이터 테이블
+    st.subheader("📋 상세 데이터")
+    
+    display_df = df_returns.copy()
+    display_df.index = [f"{TOP10_STOCKS.get(t, t)} ({t})" for t in display_df.index]
+    display_df.columns = ['종목명', '시작가($)', '종가($)', '변동률(%)', '변동액($)']
+    display_df = display_df.drop('종목명', axis=1)
+    
+    display_df['시작가($)'] = display_df['시작가($)'].apply(lambda x: f"${x:.2f}")
+    display_df['종가($)'] = display_df['종가($)'].apply(lambda x: f"${x:.2f}")
+    display_df['변동률(%)'] = display_df['변동률(%)'].apply(lambda x: f"{x:.2f}%")
+    display_df['변동액($)'] = display_df['변동액($)'].apply(lambda x: f"${x:.2f}")
+    
+    st.dataframe(display_df, use_container_width=True)
+    
+    # 푸터
+    st.markdown("---")
+    st.caption("데이터 출처: Yahoo Finance | 시총 순위는 변동될 수 있습니다. | 데이터는 1시간 캐시됩니다.")
 
-else:
-    fig = px.bar(
-        sortable.dropna(subset=["Change"]),
-        x="Ticker",
-        y="Change",
-        hover_data=["Name", "Used Trading Days", "Data Points"],
-        title=f"최근 ~{n_days} 거래일 등락액(가격) 비교",
-    )
-    st.plotly_chart(fig, use_container_width=True)
+if __name__ == "__main__":
+    main()
