@@ -11,20 +11,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# CSS 스타일링
-st.markdown("""
-<style>
-    .stApp { background: #0f172a; }
-    .metric-card {
-        background: linear-gradient(145deg, #1e293b, #0f172a);
-        border-radius: 16px;
-        padding: 20px;
-        border: 1px solid #334155;
-    }
-    div[data-testid="stMetricValue"] { font-size: 1.5rem; }
-</style>
-""", unsafe_allow_html=True)
-
 # 글로벌 시총 Top10 종목
 TOP10_STOCKS = {
     "AAPL": "Apple",
@@ -40,18 +26,27 @@ TOP10_STOCKS = {
 }
 
 @st.cache_data(ttl=3600)
-def get_stock_data(ticker, days):
-    """개별 주식 데이터 가져오기 - Ticker.history() 방식"""
-    try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period=f"{days + 10}d")
-        
-        if hist.empty or len(hist) < 2:
-            return None
+def get_all_stock_data(days):
+    """모든 주식 데이터 한번에 가져오기"""
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=days + 30)
+    
+    results = {}
+    errors = []
+    
+    for ticker, name in TOP10_STOCKS.items():
+        try:
+            stock = yf.Ticker(ticker)
+            hist = stock.history(start=start_date, end=end_date)
             
-        return hist
-    except Exception as e:
-        return None
+            if not hist.empty and len(hist) >= 2:
+                results[ticker] = hist
+            else:
+                errors.append(f"{ticker}: 데이터 없음")
+        except Exception as e:
+            errors.append(f"{ticker}: {str(e)[:50]}")
+    
+    return results, errors
 
 def calculate_return(hist, days):
     """수익률 계산"""
@@ -60,7 +55,7 @@ def calculate_return(hist, days):
     
     df = hist.tail(days + 1)
     if len(df) < 2:
-        return None
+        df = hist.tail(2)
         
     start_price = df['Close'].iloc[0]
     end_price = df['Close'].iloc[-1]
@@ -77,165 +72,122 @@ def main():
     st.title("📈 글로벌 시총 Top10 주가 분석")
     st.markdown("---")
     
-    # 사이드바 설정
+    # 사이드바
     st.sidebar.header("⚙️ 설정")
     days = st.sidebar.slider("분석 기간 (일)", min_value=1, max_value=365, value=30)
     
-    if st.sidebar.button("🔄 데이터 새로고침"):
+    if st.sidebar.button("🔄 새로고침"):
         st.cache_data.clear()
         st.rerun()
     
     # 데이터 로드
-    with st.spinner('주가 데이터를 불러오는 중...'):
-        stock_data = {}
-        returns = {}
-        
-        for ticker, name in TOP10_STOCKS.items():
-            hist = get_stock_data(ticker, days)
-            if hist is not None:
-                stock_data[ticker] = hist
-                ret = calculate_return(hist, days)
-                if ret:
-                    returns[ticker] = {**ret, 'name': name}
+    with st.spinner('데이터 로딩 중...'):
+        stock_data, errors = get_all_stock_data(days)
     
-    if not returns:
-        st.error("데이터를 불러올 수 없습니다. 잠시 후 다시 시도해주세요.")
+    # 에러 표시 (디버깅용)
+    if errors:
+        with st.sidebar.expander("⚠️ 로드 실패 종목"):
+            for err in errors:
+                st.caption(err)
+    
+    if not stock_data:
+        st.error("데이터를 불러올 수 없습니다.")
+        st.info("잠시 후 새로고침 버튼을 눌러주세요.")
+        
+        # 디버깅: 단일 종목 테스트
+        st.markdown("---")
+        st.subheader("🔧 디버깅")
+        test_ticker = st.selectbox("테스트할 종목", list(TOP10_STOCKS.keys()))
+        if st.button("테스트"):
+            try:
+                stock = yf.Ticker(test_ticker)
+                hist = stock.history(period="5d")
+                st.write(f"결과: {len(hist)} rows")
+                st.dataframe(hist)
+            except Exception as e:
+                st.error(f"에러: {e}")
         return
     
-    st.sidebar.success(f"✅ {len(returns)}/{len(TOP10_STOCKS)} 종목 로드됨")
+    st.sidebar.success(f"✅ {len(stock_data)}/{len(TOP10_STOCKS)} 종목 로드")
     
-    # 수익률 정렬
-    sorted_returns = dict(sorted(returns.items(), key=lambda x: x[1]['change_pct'], reverse=True))
-    tickers_sorted = list(sorted_returns.keys())
+    # 수익률 계산
+    returns = {}
+    for ticker, hist in stock_data.items():
+        ret = calculate_return(hist, days)
+        if ret:
+            returns[ticker] = {**ret, 'name': TOP10_STOCKS[ticker]}
     
-    best_ticker = tickers_sorted[0]
-    worst_ticker = tickers_sorted[-1]
-    avg_return = sum(r['change_pct'] for r in returns.values()) / len(returns)
+    if not returns:
+        st.error("수익률 계산 실패")
+        return
     
-    # 메트릭 표시
-    col1, col2, col3 = st.columns(3)
+    # 정렬
+    sorted_tickers = sorted(returns.keys(), key=lambda x: returns[x]['change_pct'], reverse=True)
+    best = sorted_tickers[0]
+    worst = sorted_tickers[-1]
+    avg = sum(r['change_pct'] for r in returns.values()) / len(returns)
     
-    with col1:
-        st.metric(
-            label=f"🚀 최고 상승 - {returns[best_ticker]['name']}",
-            value=f"${returns[best_ticker]['end_price']:.2f}",
-            delta=f"{returns[best_ticker]['change_pct']:.2f}%"
-        )
-    
-    with col2:
-        st.metric(
-            label=f"📉 최고 하락 - {returns[worst_ticker]['name']}",
-            value=f"${returns[worst_ticker]['end_price']:.2f}",
-            delta=f"{returns[worst_ticker]['change_pct']:.2f}%"
-        )
-    
-    with col3:
-        st.metric(
-            label="📊 평균 수익률",
-            value=f"{avg_return:.2f}%",
-            delta="Top10 평균"
-        )
+    # 메트릭
+    c1, c2, c3 = st.columns(3)
+    c1.metric(f"🚀 {returns[best]['name']}", f"${returns[best]['end_price']:.2f}", f"{returns[best]['change_pct']:.2f}%")
+    c2.metric(f"📉 {returns[worst]['name']}", f"${returns[worst]['end_price']:.2f}", f"{returns[worst]['change_pct']:.2f}%")
+    c3.metric("📊 평균", f"{avg:.2f}%")
     
     st.markdown("---")
     
-    # 수익률 바 차트
-    st.subheader(f"📊 최근 {days}일 수익률 비교")
+    # 바 차트
+    st.subheader(f"📊 최근 {days}일 수익률")
     
-    names = [returns[t]['name'] for t in tickers_sorted]
-    changes = [returns[t]['change_pct'] for t in tickers_sorted]
-    colors = ['#22c55e' if x >= 0 else '#ef4444' for x in changes]
+    names = [returns[t]['name'] for t in sorted_tickers]
+    vals = [returns[t]['change_pct'] for t in sorted_tickers]
+    colors = ['#22c55e' if v >= 0 else '#ef4444' for v in vals]
     
-    fig_bar = go.Figure(data=[
-        go.Bar(
-            x=names,
-            y=changes,
-            marker_color=colors,
-            text=[f"{x:.2f}%" for x in changes],
-            textposition='outside'
-        )
-    ])
-    
-    fig_bar.update_layout(
-        xaxis_title="종목",
-        yaxis_title="수익률 (%)",
-        height=450,
-        showlegend=False,
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
-        font=dict(color='#e2e8f0'),
-        xaxis=dict(gridcolor='#334155'),
-        yaxis=dict(gridcolor='#334155')
-    )
-    
+    fig_bar = go.Figure(go.Bar(
+        x=names, y=vals,
+        marker_color=colors,
+        text=[f"{v:.1f}%" for v in vals],
+        textposition='outside'
+    ))
+    fig_bar.update_layout(height=400, xaxis_title="종목", yaxis_title="수익률(%)")
     st.plotly_chart(fig_bar, use_container_width=True)
     
     st.markdown("---")
     
-    # 주가 추이 차트
-    st.subheader("📈 주가 추이 (정규화)")
-    
-    available = list(stock_data.keys())
-    default_selection = [best_ticker, worst_ticker] if best_ticker in available and worst_ticker in available else available[:2]
+    # 라인 차트
+    st.subheader("📈 주가 추이")
     
     selected = st.multiselect(
         "종목 선택",
-        options=available,
-        default=default_selection,
+        list(stock_data.keys()),
+        default=[best, worst],
         format_func=lambda x: f"{TOP10_STOCKS[x]} ({x})"
     )
     
     if selected:
         fig_line = go.Figure()
-        
-        for ticker in selected:
-            df = stock_data[ticker].tail(days + 1)
-            normalized = (df['Close'] / df['Close'].iloc[0]) * 100
-            
+        for t in selected:
+            df = stock_data[t].tail(days + 1)
+            norm = (df['Close'] / df['Close'].iloc[0]) * 100
             fig_line.add_trace(go.Scatter(
-                x=df.index,
-                y=normalized,
-                mode='lines',
-                name=f"{TOP10_STOCKS[ticker]}",
-                hovertemplate=f"{TOP10_STOCKS[ticker]}<br>날짜: %{{x|%Y-%m-%d}}<br>정규화: %{{y:.2f}}<br>실제가: $%{{customdata:.2f}}<extra></extra>",
-                customdata=df['Close']
+                x=df.index, y=norm,
+                mode='lines', name=TOP10_STOCKS[t]
             ))
-        
-        fig_line.update_layout(
-            xaxis_title="날짜",
-            yaxis_title="정규화 가격 (시작=100)",
-            height=450,
-            hovermode='x unified',
-            legend=dict(orientation="h", yanchor="bottom", y=1.02),
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)',
-            font=dict(color='#e2e8f0'),
-            xaxis=dict(gridcolor='#334155'),
-            yaxis=dict(gridcolor='#334155')
-        )
-        
+        fig_line.update_layout(height=400, yaxis_title="정규화 (시작=100)")
         st.plotly_chart(fig_line, use_container_width=True)
     
     st.markdown("---")
     
-    # 상세 테이블
-    st.subheader("📋 상세 데이터")
+    # 테이블
+    st.subheader("📋 상세")
+    rows = [{
+        "종목": f"{returns[t]['name']} ({t})",
+        "시작가": f"${returns[t]['start_price']:.2f}",
+        "종가": f"${returns[t]['end_price']:.2f}",
+        "변동률": f"{returns[t]['change_pct']:.2f}%"
+    } for t in sorted_tickers]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     
-    table_data = []
-    for ticker in tickers_sorted:
-        r = returns[ticker]
-        table_data.append({
-            "종목": f"{r['name']} ({ticker})",
-            "시작가": f"${r['start_price']:.2f}",
-            "종가": f"${r['end_price']:.2f}",
-            "변동률": f"{r['change_pct']:.2f}%",
-            "변동액": f"${r['change_abs']:.2f}"
-        })
-    
-    st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
-    
-    # 푸터
-    st.markdown("---")
-    st.caption("데이터: Yahoo Finance | 1시간 캐시 | 시총 순위는 변동 가능")
+    st.caption("데이터: Yahoo Finance")
 
 if __name__ == "__main__":
     main()
