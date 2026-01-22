@@ -1,264 +1,212 @@
-# main.py
-import time
-from datetime import datetime, timedelta
-
-import pandas as pd
-import plotly.express as px
-import requests
 import streamlit as st
 import yfinance as yf
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
 
-st.set_page_config(page_title="Global Top10 Movers", layout="wide")
+# 페이지 설정
+st.set_page_config(
+    page_title="글로벌 시총 Top10 주가 분석",
+    page_icon="📈",
+    layout="wide"
+)
 
-DEFAULT_TOP10 = {
-    "NVDA": "NVIDIA",
+# 글로벌 시총 Top10 종목 (2024년 기준)
+TOP10_STOCKS = {
     "AAPL": "Apple",
-    "GOOG": "Alphabet (GOOG)",
     "MSFT": "Microsoft",
+    "NVDA": "NVIDIA",
+    "GOOGL": "Alphabet (Google)",
     "AMZN": "Amazon",
-    "TSM": "TSMC (ADR)",
-    "META": "Meta Platforms",
-    "AVGO": "Broadcom",
-    "TSLA": "Tesla",
-    "BRK-B": "Berkshire Hathaway (B)",
+    "META": "Meta (Facebook)",
+    "BRK-B": "Berkshire Hathaway",
+    "TSM": "TSMC",
+    "LLY": "Eli Lilly",
+    "AVGO": "Broadcom"
 }
 
-# ---- 야후 차단 완화를 위한 세션(User-Agent) ----
-def make_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update(
-        {
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            )
-        }
-    )
-    return s
-
-# ---- 여러 티커를 한 번에 다운로드(요청 횟수 최소화) ----
-@st.cache_data(show_spinner=False, ttl=60 * 60)  # 1시간 캐시
-def fetch_prices_batch(tickers: list[str], lookback_calendar_days: int) -> tuple[pd.DataFrame, str | None]:
-    """
-    return: (prices_df, error_message)
-    prices_df columns: Date, Ticker, Open, High, Low, Close, Adj Close, Volume
-    """
-    if not tickers:
-        return pd.DataFrame(), "No tickers."
-
-    end = datetime.utcnow().date() + timedelta(days=1)
-    start = end - timedelta(days=lookback_calendar_days)
-
-    session = make_session()
-
-    # 재시도(간단 백오프)
-    last_err = None
-    for attempt in range(1, 4):  # 3회
+@st.cache_data(ttl=3600)
+def get_stock_data(tickers, days):
+    """주식 데이터 가져오기"""
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=days + 10)  # 여유분 추가
+    
+    data = {}
+    for ticker in tickers:
         try:
-            raw = yf.download(
-                tickers=tickers,
-                start=start.isoformat(),
-                end=end.isoformat(),
-                group_by="column",
-                progress=False,
-                threads=True,
-                auto_adjust=False,
-                session=session,   # 핵심: 세션 주입
-            )
-
-            if raw is None or raw.empty:
-                last_err = "yfinance returned empty dataframe."
-                time.sleep(0.8 * attempt)
-                continue
-
-            # raw가 멀티인덱스 컬럼일 수 있음: (Open, AAPL) 같은 형태
-            raw = raw.reset_index()
-
-            # 멀티티커 형태 정규화
-            # 1) 단일 티커면 컬럼이 평평할 수도 있음
-            if isinstance(raw.columns, pd.MultiIndex):
-                # Date + (field, ticker) -> long
-                date_col = raw.columns[0]
-                long_rows = []
-                fields = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
-                for t in tickers:
-                    cols = []
-                    for f in fields:
-                        if (f, t) in raw.columns:
-                            cols.append((f, t))
-                        else:
-                            cols.append(None)
-                    # 하나라도 있어야 유효
-                    if all(c is None for c in cols):
-                        continue
-
-                    tmp = pd.DataFrame({"Date": raw[date_col]})
-                    for f, c in zip(fields, cols):
-                        tmp[f] = raw[c] if c is not None else pd.NA
-                    tmp["Ticker"] = t
-                    long_rows.append(tmp)
-
-                out = pd.concat(long_rows, ignore_index=True) if long_rows else pd.DataFrame()
-            else:
-                # 단일 티커 다운로드로 들어온 경우
-                out = raw.copy()
-                out["Ticker"] = tickers[0]
-                out.rename(columns={"index": "Date"}, inplace=True)
-
-            # 필수 정리
-            out = out.dropna(subset=["Close"])
-            out["Date"] = pd.to_datetime(out["Date"])
-            out = out.sort_values(["Ticker", "Date"])
-            return out, None
-
+            stock = yf.Ticker(ticker)
+            hist = stock.history(start=start_date, end=end_date)
+            if not hist.empty:
+                data[ticker] = hist
         except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-            time.sleep(0.8 * attempt)
+            st.warning(f"{ticker} 데이터 로드 실패: {e}")
+    
+    return data
 
-    return pd.DataFrame(), last_err
+def calculate_returns(data, days):
+    """수익률 계산"""
+    returns = {}
+    for ticker, df in data.items():
+        if len(df) >= 2:
+            # 최근 N일 데이터만 사용
+            df_recent = df.tail(days + 1)
+            if len(df_recent) >= 2:
+                start_price = df_recent['Close'].iloc[0]
+                end_price = df_recent['Close'].iloc[-1]
+                pct_change = ((end_price - start_price) / start_price) * 100
+                returns[ticker] = {
+                    'name': TOP10_STOCKS[ticker],
+                    'start_price': start_price,
+                    'end_price': end_price,
+                    'change_pct': pct_change,
+                    'change_abs': end_price - start_price
+                }
+    return returns
 
-
-def compute_move_from_prices(prices: pd.DataFrame, ticker: str, n_trading_days: int) -> dict:
-    df = prices[prices["Ticker"] == ticker].sort_values("Date")
-    if df.empty:
-        return {"start_close": None, "last_close": None, "chg": None, "pct": None, "used_days": 0, "points": 0}
-
-    close = df["Close"].dropna()
-    if close.shape[0] < 2:
-        last = float(close.iloc[-1]) if close.shape[0] else None
-        return {"start_close": None, "last_close": last, "chg": None, "pct": None, "used_days": int(close.shape[0]), "points": int(df.shape[0])}
-
-    idx_start = max(0, close.shape[0] - 1 - n_trading_days)
-    start_close = float(close.iloc[idx_start])
-    last_close = float(close.iloc[-1])
-    chg = last_close - start_close
-    pct = (chg / start_close) * 100 if start_close != 0 else None
-    used_days = (close.shape[0] - 1) - idx_start
-
-    return {
-        "start_close": start_close,
-        "last_close": last_close,
-        "chg": chg,
-        "pct": pct,
-        "used_days": used_days,
-        "points": int(df.shape[0]),
-    }
-
-
-st.title("🌍 글로벌 시총 Top10: 최근 N일 주가 변동 Top/Bottom 분석 (yfinance + Plotly)")
-st.caption("Streamlit Cloud에서 yfinance가 빈 데이터/429를 주는 경우가 있어 배치 다운로드+세션 헤더+재시도를 적용했습니다.")
-
-with st.sidebar:
-    st.header("설정")
-    n_days = st.slider("최근 N일(거래일 기준에 가깝게)", 1, 120, 20, 1)
-
-    metric = st.radio("정렬 기준", ["등락률(%)", "등락액(가격)"], horizontal=True)
-    lookback_calendar = int(max(45, n_days * 3))
-
-    st.divider()
-    tickers_text = st.text_area(
-        "티커 입력(쉼표 구분)",
-        value=",".join(DEFAULT_TOP10.keys()),
-        height=80,
+def main():
+    st.title("📈 글로벌 시총 Top10 주가 분석")
+    st.markdown("---")
+    
+    # 사이드바 설정
+    st.sidebar.header("⚙️ 설정")
+    days = st.sidebar.slider("분석 기간 (일)", min_value=1, max_value=365, value=30)
+    
+    # 데이터 로드
+    with st.spinner("주가 데이터를 불러오는 중..."):
+        stock_data = get_stock_data(list(TOP10_STOCKS.keys()), days)
+    
+    if not stock_data:
+        st.error("데이터를 불러올 수 없습니다.")
+        return
+    
+    # 수익률 계산
+    returns = calculate_returns(stock_data, days)
+    
+    if not returns:
+        st.error("수익률을 계산할 수 없습니다.")
+        return
+    
+    # 수익률 데이터프레임 생성
+    df_returns = pd.DataFrame(returns).T
+    df_returns = df_returns.sort_values('change_pct', ascending=False)
+    
+    # 최고/최저 종목
+    best_ticker = df_returns.index[0]
+    worst_ticker = df_returns.index[-1]
+    
+    # 메트릭 표시
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric(
+            label=f"🚀 최고 상승 - {returns[best_ticker]['name']}",
+            value=f"${returns[best_ticker]['end_price']:.2f}",
+            delta=f"{returns[best_ticker]['change_pct']:.2f}%"
+        )
+    
+    with col2:
+        st.metric(
+            label=f"📉 최고 하락 - {returns[worst_ticker]['name']}",
+            value=f"${returns[worst_ticker]['end_price']:.2f}",
+            delta=f"{returns[worst_ticker]['change_pct']:.2f}%"
+        )
+    
+    with col3:
+        avg_return = df_returns['change_pct'].mean()
+        st.metric(
+            label="📊 평균 수익률",
+            value=f"{avg_return:.2f}%",
+            delta="Top10 평균"
+        )
+    
+    st.markdown("---")
+    
+    # 수익률 바 차트
+    st.subheader(f"📊 최근 {days}일 수익률 비교")
+    
+    colors = ['#00CC96' if x >= 0 else '#EF553B' for x in df_returns['change_pct']]
+    
+    fig_bar = go.Figure(data=[
+        go.Bar(
+            x=[f"{row['name']}" for _, row in df_returns.iterrows()],
+            y=df_returns['change_pct'],
+            marker_color=colors,
+            text=[f"{x:.2f}%" for x in df_returns['change_pct']],
+            textposition='outside'
+        )
+    ])
+    
+    fig_bar.update_layout(
+        xaxis_title="종목",
+        yaxis_title="수익률 (%)",
+        height=500,
+        showlegend=False
     )
-    tickers = [t.strip().upper() for t in tickers_text.split(",") if t.strip()]
-    top_k = st.slider("Top/Bottom 개수", 3, 10, 5, 1)
-
-    st.divider()
-    chart_mode = st.selectbox("차트", ["개별 종목 라인", "등락률 막대", "등락액 막대"])
-
-# ---- “분석 실행” 버튼으로 불필요한 재요청 줄이기 ----
-run = st.button("🚀 분석 실행", type="primary")
-
-if run:
-    with st.spinner("야후에서 데이터를 불러오는 중..."):
-        prices, err = fetch_prices_batch(tickers, lookback_calendar)
-
-    if err or prices.empty:
-        st.error("데이터를 불러오지 못했어요.")
-        st.write("아래는 디버그 정보예요(대부분 429/차단/네트워크 이슈).")
-        st.code(str(err))
-        st.info(
-            "해결 팁:\n"
-            "1) 잠시 후 다시 실행(429일 수 있음)\n"
-            "2) 티커 수를 줄여서 테스트\n"
-            "3) 캐시가 유지되도록 너무 자주 새로고침하지 않기\n"
+    
+    st.plotly_chart(fig_bar, use_container_width=True)
+    
+    st.markdown("---")
+    
+    # 주가 추이 차트
+    st.subheader("📈 주가 추이")
+    
+    selected_stocks = st.multiselect(
+        "종목 선택",
+        options=list(TOP10_STOCKS.keys()),
+        default=[best_ticker, worst_ticker],
+        format_func=lambda x: f"{TOP10_STOCKS[x]} ({x})"
+    )
+    
+    if selected_stocks:
+        fig_line = go.Figure()
+        
+        for ticker in selected_stocks:
+            if ticker in stock_data:
+                df = stock_data[ticker].tail(days + 1)
+                # 정규화 (시작점 = 100)
+                normalized = (df['Close'] / df['Close'].iloc[0]) * 100
+                
+                fig_line.add_trace(go.Scatter(
+                    x=df.index,
+                    y=normalized,
+                    mode='lines',
+                    name=f"{TOP10_STOCKS[ticker]} ({ticker})",
+                    hovertemplate=f"{TOP10_STOCKS[ticker]}<br>날짜: %{{x}}<br>정규화: %{{y:.2f}}<br>실제가: $%{{customdata:.2f}}<extra></extra>",
+                    customdata=df['Close']
+                ))
+        
+        fig_line.update_layout(
+            xaxis_title="날짜",
+            yaxis_title="정규화 가격 (시작=100)",
+            height=500,
+            hovermode='x unified',
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
         )
-        st.stop()
+        
+        st.plotly_chart(fig_line, use_container_width=True)
+    
+    st.markdown("---")
+    
+    # 상세 데이터 테이블
+    st.subheader("📋 상세 데이터")
+    
+    display_df = df_returns.copy()
+    display_df.index = [f"{TOP10_STOCKS[t]} ({t})" for t in display_df.index]
+    display_df.columns = ['종목명', '시작가($)', '종가($)', '변동률(%)', '변동액($)']
+    display_df = display_df.drop('종목명', axis=1)
+    
+    # 포맷팅
+    display_df['시작가($)'] = display_df['시작가($)'].apply(lambda x: f"${x:.2f}")
+    display_df['종가($)'] = display_df['종가($)'].apply(lambda x: f"${x:.2f}")
+    display_df['변동률(%)'] = display_df['변동률(%)'].apply(lambda x: f"{x:.2f}%")
+    display_df['변동액($)'] = display_df['변동액($)'].apply(lambda x: f"${x:.2f}")
+    
+    st.dataframe(display_df, use_container_width=True)
+    
+    # 푸터
+    st.markdown("---")
+    st.caption("데이터 출처: Yahoo Finance | 시총 순위는 변동될 수 있습니다.")
 
-    rows = []
-    for t in tickers:
-        move = compute_move_from_prices(prices, t, n_days)
-        rows.append(
-            {
-                "Ticker": t,
-                "Name": DEFAULT_TOP10.get(t, t),
-                "Start Close": move["start_close"],
-                "Last Close": move["last_close"],
-                "Change": move["chg"],
-                "Change (%)": move["pct"],
-                "Used Trading Days": move["used_days"],
-                "Data Points": move["points"],
-            }
-        )
-
-    result = pd.DataFrame(rows)
-
-    if metric == "등락률(%)":
-        sortable = result.dropna(subset=["Change (%)"]).copy()
-        sort_col = "Change (%)"
-    else:
-        sortable = result.dropna(subset=["Change"]).copy()
-        sort_col = "Change"
-
-    if sortable.empty:
-        st.error("계산 가능한 결과가 없어요(가격 데이터가 비었거나 Close가 부족).")
-        st.dataframe(result, use_container_width=True)
-        st.stop()
-
-    sortable = sortable.sort_values(sort_col, ascending=False).reset_index(drop=True)
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader(f"📈 상승 Top {top_k}")
-        st.dataframe(sortable.head(top_k), use_container_width=True)
-    with c2:
-        st.subheader(f"📉 하락 Top {top_k}")
-        st.dataframe(sortable.tail(top_k).sort_values(sort_col, ascending=True), use_container_width=True)
-
-    st.divider()
-    st.subheader("전체 결과")
-    st.dataframe(sortable, use_container_width=True)
-
-    st.divider()
-    st.subheader("📊 시각화")
-
-    if chart_mode == "개별 종목 라인":
-        pick = st.selectbox("종목 선택", sortable["Ticker"].tolist(), index=0)
-        dfp = prices[prices["Ticker"] == pick].sort_values("Date").tail(max(60, n_days * 2))
-        fig = px.line(dfp, x="Date", y="Close", title=f"{pick} Close Price (최근 구간)")
-        st.plotly_chart(fig, use_container_width=True)
-
-    elif chart_mode == "등락률 막대":
-        fig = px.bar(
-            sortable.dropna(subset=["Change (%)"]),
-            x="Ticker",
-            y="Change (%)",
-            hover_data=["Name", "Start Close", "Last Close", "Used Trading Days", "Data Points"],
-            title=f"최근 ~{n_days} 거래일 등락률(%) 비교",
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    else:
-        fig = px.bar(
-            sortable.dropna(subset=["Change"]),
-            x="Ticker",
-            y="Change",
-            hover_data=["Name", "Start Close", "Last Close", "Used Trading Days", "Data Points"],
-            title=f"최근 ~{n_days} 거래일 등락액(가격) 비교",
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-else:
-    st.info("왼쪽에서 설정 후 **‘🚀 분석 실행’**을 눌러 주세요. (Streamlit Cloud에서 과도한 재요청을 줄이기 위해 버튼으로 실행합니다.)")
+if __name__ == "__main__":
+    main()
